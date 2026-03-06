@@ -7,6 +7,8 @@
 ![Java](https://img.shields.io/badge/Java-17%2B-orange)
 ![License](https://img.shields.io/badge/license-MIT-brightgreen)
 
+<img width="1119" height="884" alt="Screenshot 2026-03-06 110419" src="https://github.com/user-attachments/assets/edea4a5a-427d-4971-9052-e66055899203" />
+
 ---
 
 ## Overview
