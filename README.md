@@ -195,6 +195,8 @@ blackmarker/
 ./gradlew test jar   # unit tests + build/libs/BlackMarker-<version>.jar (Gson is bundled)
 ```
 
+GitHub Actions (`.github/workflows/build.yml`) runs the tests and builds the jar on every push and pull request; the jar is available as a workflow artifact. Pushing a tag such as `v1.1` also publishes it as a GitHub release.
+
 ## Requirements
 
 - **Burp Suite** Professional or Community (2023.1+)
