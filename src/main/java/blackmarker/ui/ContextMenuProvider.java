@@ -15,10 +15,14 @@ import java.awt.datatransfer.StringSelection;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.ExecutionException;
 
 /**
  * Provides "Copy Masked Request" and "Copy Masked Response" context menu items
  * in all Burp tools. Copies the masked version to the system clipboard.
+ *
+ * Masking happens in a background worker (selections can be large); only the clipboard
+ * write runs on the event thread.
  */
 public class ContextMenuProvider implements ContextMenuItemsProvider {
 
@@ -29,6 +33,9 @@ public class ContextMenuProvider implements ContextMenuItemsProvider {
         this.api = api;
         this.engine = engine;
     }
+
+    /** Masked text plus how many items were masked, for the log message. */
+    private record Copied(String text, int maskedItems) {}
 
     @Override
     public List<Component> provideMenuItems(ContextMenuEvent event) {
@@ -47,43 +54,32 @@ public class ContextMenuProvider implements ContextMenuItemsProvider {
 
             if (reqRes.request() != null) {
                 JMenuItem copyRequest = new JMenuItem("BlackMarker: Copy Masked Request");
-                copyRequest.addActionListener(e -> {
-                    String raw = reqRes.request().toString();
-                    MaskingResult result = engine.mask(raw);
-                    copyToClipboard(result.getMaskedText());
-                    showNotification("Masked request copied to clipboard (" +
-                        result.getMatchCount() + " items masked)");
-                });
+                copyRequest.addActionListener(e -> copyMasked("Masked request copied to clipboard", () -> {
+                    MaskingResult result = engine.mask(MaskingEngine.clip(reqRes.request().toString()));
+                    return new Copied(result.getMaskedText(), result.getMatchCount());
+                }));
                 items.add(copyRequest);
             }
 
             if (reqRes.response() != null) {
                 JMenuItem copyResponse = new JMenuItem("BlackMarker: Copy Masked Response");
-                copyResponse.addActionListener(e -> {
-                    String raw = reqRes.response().toString();
-                    MaskingResult result = engine.mask(raw);
-                    copyToClipboard(result.getMaskedText());
-                    showNotification("Masked response copied to clipboard (" +
-                        result.getMatchCount() + " items masked)");
-                });
+                copyResponse.addActionListener(e -> copyMasked("Masked response copied to clipboard", () -> {
+                    MaskingResult result = engine.mask(MaskingEngine.clip(reqRes.response().toString()));
+                    return new Copied(result.getMaskedText(), result.getMatchCount());
+                }));
                 items.add(copyResponse);
             }
 
             // Add "Copy Both Masked" option
             if (reqRes.request() != null && reqRes.response() != null) {
                 JMenuItem copyBoth = new JMenuItem("BlackMarker: Copy Both Masked");
-                copyBoth.addActionListener(e -> {
-                    StringBuilder sb = new StringBuilder();
-                    sb.append("=== REQUEST ===\n\n");
-                    MaskingResult reqResult = engine.mask(reqRes.request().toString());
-                    sb.append(reqResult.getMaskedText());
-                    sb.append("\n\n=== RESPONSE ===\n\n");
-                    MaskingResult resResult = engine.mask(reqRes.response().toString());
-                    sb.append(resResult.getMaskedText());
-                    copyToClipboard(sb.toString());
-                    showNotification("Masked request+response copied (" +
-                        (reqResult.getMatchCount() + resResult.getMatchCount()) + " items masked)");
-                });
+                copyBoth.addActionListener(e -> copyMasked("Masked request+response copied", () -> {
+                    MaskingResult reqResult = engine.mask(MaskingEngine.clip(reqRes.request().toString()));
+                    MaskingResult resResult = engine.mask(MaskingEngine.clip(reqRes.response().toString()));
+                    String text = "=== REQUEST ===\n\n" + reqResult.getMaskedText()
+                        + "\n\n=== RESPONSE ===\n\n" + resResult.getMaskedText();
+                    return new Copied(text, reqResult.getMatchCount() + resResult.getMatchCount());
+                }));
                 items.add(copyBoth);
             }
 
@@ -93,31 +89,30 @@ public class ContextMenuProvider implements ContextMenuItemsProvider {
             if (!selectedMessages.isEmpty()) {
                 JMenuItem copyAll = new JMenuItem("BlackMarker: Copy " +
                     selectedMessages.size() + " Masked Message(s)");
-                copyAll.addActionListener(e -> {
-                    StringBuilder sb = new StringBuilder();
-                    int totalMasked = 0;
-                    for (int i = 0; i < selectedMessages.size(); i++) {
-                        HttpRequestResponse rr = selectedMessages.get(i);
-                        sb.append("=== Message ").append(i + 1).append(" ===\n\n");
-                        if (rr.request() != null) {
-                            sb.append("--- Request ---\n");
-                            MaskingResult result = engine.mask(rr.request().toString());
-                            sb.append(result.getMaskedText());
-                            totalMasked += result.getMatchCount();
-                            sb.append("\n\n");
+                copyAll.addActionListener(e -> copyMasked(
+                    "Copied " + selectedMessages.size() + " masked message(s)", () -> {
+                        StringBuilder sb = new StringBuilder();
+                        int totalMasked = 0;
+                        for (int i = 0; i < selectedMessages.size(); i++) {
+                            HttpRequestResponse rr = selectedMessages.get(i);
+                            sb.append("=== Message ").append(i + 1).append(" ===\n\n");
+                            if (rr.request() != null) {
+                                sb.append("--- Request ---\n");
+                                MaskingResult result = engine.mask(MaskingEngine.clip(rr.request().toString()));
+                                sb.append(result.getMaskedText());
+                                totalMasked += result.getMatchCount();
+                                sb.append("\n\n");
+                            }
+                            if (rr.response() != null) {
+                                sb.append("--- Response ---\n");
+                                MaskingResult result = engine.mask(MaskingEngine.clip(rr.response().toString()));
+                                sb.append(result.getMaskedText());
+                                totalMasked += result.getMatchCount();
+                                sb.append("\n\n");
+                            }
                         }
-                        if (rr.response() != null) {
-                            sb.append("--- Response ---\n");
-                            MaskingResult result = engine.mask(rr.response().toString());
-                            sb.append(result.getMaskedText());
-                            totalMasked += result.getMatchCount();
-                            sb.append("\n\n");
-                        }
-                    }
-                    copyToClipboard(sb.toString());
-                    showNotification("Copied " + selectedMessages.size() +
-                        " masked message(s) (" + totalMasked + " items masked)");
-                });
+                        return new Copied(sb.toString(), totalMasked);
+                    }));
                 items.add(copyAll);
             }
         }
@@ -125,12 +120,28 @@ public class ContextMenuProvider implements ContextMenuItemsProvider {
         return items;
     }
 
-    private void copyToClipboard(String text) {
-        StringSelection selection = new StringSelection(text);
-        Toolkit.getDefaultToolkit().getSystemClipboard().setContents(selection, null);
-    }
+    /** Run {@code job} off the EDT, then put its text on the clipboard. */
+    private void copyMasked(String message, java.util.concurrent.Callable<Copied> job) {
+        new SwingWorker<Copied, Void>() {
+            @Override
+            protected Copied doInBackground() throws Exception {
+                return job.call();
+            }
 
-    private void showNotification(String message) {
-        api.logging().logToOutput("[BlackMarker] " + message);
+            @Override
+            protected void done() {
+                try {
+                    Copied copied = get();
+                    Toolkit.getDefaultToolkit().getSystemClipboard()
+                        .setContents(new StringSelection(copied.text()), null);
+                    api.logging().logToOutput("[BlackMarker] " + message
+                        + " (" + copied.maskedItems() + " items masked)");
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } catch (ExecutionException e) {
+                    api.logging().logToError("[BlackMarker] Copy masked failed: " + e.getCause());
+                }
+            }
+        }.execute();
     }
 }

@@ -4,140 +4,105 @@ import blackmarker.model.MaskMatch;
 import blackmarker.model.RuleCategory;
 
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Automatically tracks session-specific values (cookies, tokens, CSRF tokens)
  * observed during the session and masks them in subsequent requests/responses.
+ *
+ * Callers (the HTTP handler) feed it individual headers and small bodies; nothing here
+ * ever sees or keeps a whole HTTP message. The set of tracked values is bounded.
  */
 public class SessionValueTracker {
 
-    private boolean enabled = true;
-    private int minValueLength = 8;
+    /** Upper bound on remembered values; the oldest are evicted first. */
+    public static final int MAX_TRACKED_VALUES = 1000;
 
-    /**
-     * Map of tracked values: value -> description/source.
-     */
-    private final Map<String, String> trackedValues = new ConcurrentHashMap<>();
+    private volatile boolean enabled = true;
+    private volatile int minValueLength = 8;
 
-    /**
-     * Headers whose values should be automatically tracked.
-     */
+    /** value -> description/source, insertion ordered; guarded by {@code this}. */
+    private final LinkedHashMap<String, String> trackedValues = new LinkedHashMap<>();
+
+    /** Headers whose whole value (minus an auth scheme) is tracked. */
     private static final Set<String> TRACKED_HEADERS = Set.of(
-        "set-cookie", "authorization", "x-api-key", "x-auth-token",
+        "authorization", "x-api-key", "x-auth-token",
         "x-csrf-token", "x-xsrf-token", "x-access-token"
     );
 
-    /**
-     * Cookie names whose values should be automatically tracked.
-     */
+    /** Cookie names whose values are tracked (lowercase). */
     private static final Set<String> TRACKED_COOKIE_NAMES = Set.of(
         "jsessionid", "phpsessid", "asp.net_sessionid", "session",
         "session_id", "sid", "token", "auth_token", "access_token",
         "csrf_token", "_csrf", "xsrf-token"
     );
 
-    /**
-     * JSON/form parameter names whose values should be tracked.
-     */
+    /** JSON/form parameter names whose values are tracked (lowercase). */
     private static final Set<String> TRACKED_PARAM_NAMES = Set.of(
         "access_token", "refresh_token", "token", "session_token",
-        "csrf_token", "authenticity_token", "api_key", "apikey",
-        "_token", "nonce", "state", "code"
+        "csrf_token", "authenticity_token", "api_key", "apikey", "_token"
     );
 
+    /** Matches {@code "param_name": "value"} for every tracked parameter in one pass. */
+    private static final Pattern JSON_PARAM = Pattern.compile(
+        "\"(" + String.join("|", TRACKED_PARAM_NAMES) + ")\"\\s*:\\s*\"([^\"]+)\"",
+        Pattern.CASE_INSENSITIVE);
+
     /**
-     * Learn values from an HTTP message (request or response as raw text).
-     * Extracts trackable session values for future masking.
+     * Learn from a single header. Cheap for headers that are not interesting.
      */
-    public void learnFromMessage(String rawMessage) {
-        if (!enabled || rawMessage == null) return;
+    public void learnFromHeader(String name, String value) {
+        if (!enabled || name == null || value == null) return;
+        String lname = name.toLowerCase(Locale.ROOT);
 
-        // Extract header values
-        learnFromHeaders(rawMessage);
-
-        // Extract cookie values
-        learnFromCookies(rawMessage);
-
-        // Extract JSON parameter values
-        learnFromJsonParams(rawMessage);
-
-        // Extract form parameter values
-        learnFromFormParams(rawMessage);
-    }
-
-    private void learnFromHeaders(String raw) {
-        String[] lines = raw.split("\\r?\\n");
-        for (String line : lines) {
-            if (line.isEmpty()) break; // End of headers
-            int colonIdx = line.indexOf(':');
-            if (colonIdx <= 0) continue;
-            String headerName = line.substring(0, colonIdx).trim().toLowerCase();
-            String headerValue = line.substring(colonIdx + 1).trim();
-            if (TRACKED_HEADERS.contains(headerName) && headerValue.length() >= minValueLength) {
-                trackValue(headerValue, "Header: " + headerName);
+        if (lname.equals("cookie") || lname.equals("set-cookie")) {
+            learnFromCookieHeader(value);
+        } else if (TRACKED_HEADERS.contains(lname)) {
+            String v = value.strip();
+            if (lname.equals("authorization")) {
+                // Track the credential itself, not the "Bearer " / "Basic " scheme
+                int sp = v.indexOf(' ');
+                if (sp > 0) v = v.substring(sp + 1).strip();
             }
+            trackValue(v, "Header: " + lname);
         }
     }
 
-    private void learnFromCookies(String raw) {
-        String[] lines = raw.split("\\r?\\n");
-        for (String line : lines) {
-            if (line.isEmpty()) break;
-            String lower = line.toLowerCase().trim();
-
-            if (lower.startsWith("cookie:") || lower.startsWith("set-cookie:")) {
-                String value = line.substring(line.indexOf(':') + 1).trim();
-                // Parse individual cookies
-                String[] cookies = value.split(";");
-                for (String cookie : cookies) {
-                    String[] parts = cookie.trim().split("=", 2);
-                    if (parts.length == 2) {
-                        String name = parts[0].trim().toLowerCase();
-                        String val = parts[1].trim();
-                        if (TRACKED_COOKIE_NAMES.contains(name) && val.length() >= minValueLength) {
-                            trackValue(val, "Cookie: " + parts[0].trim());
-                        }
-                    }
+    private void learnFromCookieHeader(String headerValue) {
+        for (String cookie : headerValue.split(";")) {
+            String[] parts = cookie.trim().split("=", 2);
+            if (parts.length == 2) {
+                String name = parts[0].trim();
+                if (TRACKED_COOKIE_NAMES.contains(name.toLowerCase(Locale.ROOT))) {
+                    trackValue(parts[1].trim(), "Cookie: " + name);
                 }
             }
         }
     }
 
-    private void learnFromJsonParams(String raw) {
-        // Simple JSON extraction for known parameter names
-        for (String paramName : TRACKED_PARAM_NAMES) {
-            // Match "param_name": "value" or "param_name":"value"
-            String pattern = "\"" + paramName + "\"\\s*:\\s*\"([^\"]+)\"";
-            java.util.regex.Matcher m = java.util.regex.Pattern.compile(pattern,
-                java.util.regex.Pattern.CASE_INSENSITIVE).matcher(raw);
-            while (m.find()) {
-                String value = m.group(1);
-                if (value.length() >= minValueLength) {
-                    trackValue(value, "JSON param: " + paramName);
-                }
-            }
+    /**
+     * Learn from a JSON body.
+     */
+    public void learnFromJson(String body) {
+        if (!enabled || body == null || body.isEmpty()) return;
+        Matcher m = JSON_PARAM.matcher(body);
+        while (m.find()) {
+            trackValue(m.group(2), "JSON param: " + m.group(1).toLowerCase(Locale.ROOT));
         }
     }
 
-    private void learnFromFormParams(String raw) {
-        // Find URL-encoded form body (after blank line)
-        int bodyStart = raw.indexOf("\r\n\r\n");
-        if (bodyStart < 0) bodyStart = raw.indexOf("\n\n");
-        if (bodyStart < 0) return;
-
-        String body = raw.substring(bodyStart).trim();
-        // Only process if it looks like form data
-        if (body.contains("=") && !body.startsWith("{") && !body.startsWith("<")) {
-            String[] pairs = body.split("&");
-            for (String pair : pairs) {
-                String[] parts = pair.split("=", 2);
-                if (parts.length == 2) {
-                    String name = parts[0].trim().toLowerCase();
-                    String value = parts[1].trim();
-                    if (TRACKED_PARAM_NAMES.contains(name) && value.length() >= minValueLength) {
-                        trackValue(value, "Form param: " + parts[0].trim());
-                    }
+    /**
+     * Learn from an application/x-www-form-urlencoded body.
+     */
+    public void learnFromForm(String body) {
+        if (!enabled || body == null || body.isEmpty()) return;
+        for (String pair : body.trim().split("&")) {
+            String[] parts = pair.split("=", 2);
+            if (parts.length == 2) {
+                String name = parts[0].trim().toLowerCase(Locale.ROOT);
+                if (TRACKED_PARAM_NAMES.contains(name)) {
+                    trackValue(parts[1].trim(), "Form param: " + name);
                 }
             }
         }
@@ -148,8 +113,22 @@ public class SessionValueTracker {
         if (value.length() < minValueLength) return;
         if (value.equalsIgnoreCase("true") || value.equalsIgnoreCase("false")) return;
         if (value.equalsIgnoreCase("null") || value.equalsIgnoreCase("undefined")) return;
+        put(value, source);
+    }
 
+    private synchronized void put(String value, String source) {
+        // Re-insert so a value seen again counts as recent
+        trackedValues.remove(value);
         trackedValues.put(value, source);
+        if (trackedValues.size() > MAX_TRACKED_VALUES) {
+            Iterator<String> it = trackedValues.keySet().iterator();
+            it.next();
+            it.remove();
+        }
+    }
+
+    private synchronized List<Map.Entry<String, String>> snapshot() {
+        return new ArrayList<>(trackedValues.entrySet());
     }
 
     /**
@@ -157,12 +136,13 @@ public class SessionValueTracker {
      */
     public List<MaskMatch> detect(String text) {
         List<MaskMatch> matches = new ArrayList<>();
-        if (!enabled || text == null || trackedValues.isEmpty()) {
+        if (!enabled || text == null || text.isEmpty()) {
             return matches;
         }
 
-        for (Map.Entry<String, String> entry : trackedValues.entrySet()) {
+        for (Map.Entry<String, String> entry : snapshot()) {
             String value = entry.getKey();
+            if (value.length() > text.length()) continue;
             String source = entry.getValue();
             int idx = 0;
             while ((idx = text.indexOf(value, idx)) >= 0) {
@@ -170,7 +150,7 @@ public class SessionValueTracker {
                     idx, idx + value.length(),
                     RuleCategory.SESSION,
                     "Auto-learned: " + source,
-                    '\u2588'
+                    '█'
                 ));
                 idx += value.length();
             }
@@ -181,19 +161,20 @@ public class SessionValueTracker {
 
     // --- Management ---
 
-    public void clearTrackedValues() {
+    public synchronized void clearTrackedValues() {
         trackedValues.clear();
     }
 
-    public int getTrackedValueCount() {
+    public synchronized int getTrackedValueCount() {
         return trackedValues.size();
     }
 
-    public Map<String, String> getTrackedValues() {
-        return Collections.unmodifiableMap(trackedValues);
+    /** Snapshot copy (value -> source), oldest first. */
+    public synchronized Map<String, String> getTrackedValues() {
+        return Collections.unmodifiableMap(new LinkedHashMap<>(trackedValues));
     }
 
-    public void removeTrackedValue(String value) {
+    public synchronized void removeTrackedValue(String value) {
         trackedValues.remove(value);
     }
 
@@ -202,7 +183,7 @@ public class SessionValueTracker {
      */
     public void trackManualValue(String value) {
         if (value != null && value.length() >= 4) {
-            trackedValues.put(value, "Manual mask");
+            put(value, "Manual mask");
         }
     }
 

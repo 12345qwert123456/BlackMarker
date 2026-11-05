@@ -1,10 +1,13 @@
-Uuid: blackmarker-sensitive-data-masking
+Uuid: 9cb2aacfc9a54ca593fa96cac3e03c80
 ExtensionType: 1
-Name: BlackMarker - Sensitive Data Masking
+Name: BlackMarker, Sensitive Data Redactor
 RepoUrl: https://github.com/12345qwert123456/BlackMarker
-ScreenVersion: 10
+ScreenVersion: 1.1
 SerialVersion: 1
 MinPlatformVersion: 0
 ProOnly: False
 Author: Nikitin Timofey
 ShortDescription: Visual masking of sensitive data (PII, tokens, passwords, infrastructure) for safe screen sharing and screenshots. 60+ built-in rules, click-to-reveal, auto-learn, entropy detection, color-coded categories.
+EntryPoint: build/libs/BlackMarker-1.1.jar
+BuildCommand: ./gradlew jar
+SupportedProducts: Pro, Community

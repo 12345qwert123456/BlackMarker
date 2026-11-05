@@ -12,6 +12,10 @@ import javax.swing.table.TableRowSorter;
 import java.awt.*;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
@@ -21,14 +25,20 @@ import java.util.regex.PatternSyntaxException;
  */
 public class RuleManagerPanel extends JPanel {
 
+    /** Import files larger than this are rejected (a rule set is a few KB). */
+    private static final long MAX_IMPORT_BYTES = 5L * 1024 * 1024;
+
     private final MaskingEngine engine;
+    /** Parent for dialogs: Burp's main frame (keeps dialogs on the right monitor). */
+    private final Component dialogParent;
     private final RuleTableModel tableModel;
     private final JTable ruleTable;
     private final JLabel statusLabel;
     private JComboBox<String> categoryFilter;
 
-    public RuleManagerPanel(MaskingEngine engine) {
+    public RuleManagerPanel(MaskingEngine engine, Component dialogParent) {
         this.engine = engine;
+        this.dialogParent = dialogParent;
         this.tableModel = new RuleTableModel(engine.getRules());
 
         setLayout(new BorderLayout(5, 5));
@@ -207,7 +217,7 @@ public class RuleManagerPanel extends JPanel {
     private void editSelectedRule() {
         int viewRow = ruleTable.getSelectedRow();
         if (viewRow < 0) {
-            JOptionPane.showMessageDialog(this, "Please select a rule to edit.",
+            JOptionPane.showMessageDialog(dialogParent, "Please select a rule to edit.",
                 "No Selection", JOptionPane.WARNING_MESSAGE);
             return;
         }
@@ -226,7 +236,7 @@ public class RuleManagerPanel extends JPanel {
     private void deleteSelectedRule() {
         int viewRow = ruleTable.getSelectedRow();
         if (viewRow < 0) {
-            JOptionPane.showMessageDialog(this, "Please select a rule to delete.",
+            JOptionPane.showMessageDialog(dialogParent, "Please select a rule to delete.",
                 "No Selection", JOptionPane.WARNING_MESSAGE);
             return;
         }
@@ -235,7 +245,7 @@ public class RuleManagerPanel extends JPanel {
         if (rule == null) return;
 
         if (rule.isBuiltIn()) {
-            int confirm = JOptionPane.showConfirmDialog(this,
+            int confirm = JOptionPane.showConfirmDialog(dialogParent,
                 "This is a built-in rule. Disable it instead of deleting?\n" +
                 "Click 'Yes' to disable, 'No' to delete permanently.",
                 "Built-in Rule", JOptionPane.YES_NO_CANCEL_OPTION);
@@ -270,7 +280,7 @@ public class RuleManagerPanel extends JPanel {
     }
 
     private void resetRules() {
-        int confirm = JOptionPane.showConfirmDialog(this,
+        int confirm = JOptionPane.showConfirmDialog(dialogParent,
             "Reset all rules to defaults? Custom rules will be lost.",
             "Reset Rules", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
         if (confirm == JOptionPane.YES_OPTION) {
@@ -283,20 +293,26 @@ public class RuleManagerPanel extends JPanel {
     private void importRules() {
         JFileChooser fc = new JFileChooser();
         fc.setDialogTitle("Import Rules (JSON)");
-        if (fc.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
-            try {
-                String json = new String(java.nio.file.Files.readAllBytes(
-                    fc.getSelectedFile().toPath()));
-                engine.loadCustomRules(json);
-                tableModel.refresh();
-                updateStatus();
-                JOptionPane.showMessageDialog(this, "Rules imported successfully.",
-                    "Import", JOptionPane.INFORMATION_MESSAGE);
-            } catch (Exception ex) {
-                JOptionPane.showMessageDialog(this,
-                    "Failed to import rules: " + ex.getMessage(),
-                    "Import Error", JOptionPane.ERROR_MESSAGE);
+        if (fc.showOpenDialog(dialogParent) != JFileChooser.APPROVE_OPTION) return;
+
+        Path path = fc.getSelectedFile().toPath();
+        try {
+            if (Files.size(path) > MAX_IMPORT_BYTES) {
+                throw new IOException("file is larger than " + (MAX_IMPORT_BYTES / (1024 * 1024)) + " MB");
             }
+            String json = new String(Files.readAllBytes(path), StandardCharsets.UTF_8);
+            MaskingEngine.ImportSummary summary = engine.loadCustomRules(json);
+            tableModel.refresh();
+            updateStatus();
+            JOptionPane.showMessageDialog(dialogParent,
+                "Imported " + summary.added() + " rule(s)."
+                    + (summary.duplicates() > 0 ? "\nSkipped " + summary.duplicates() + " already present." : "")
+                    + (summary.invalid() > 0 ? "\nSkipped " + summary.invalid() + " invalid rule(s)." : ""),
+                "Import", JOptionPane.INFORMATION_MESSAGE);
+        } catch (IOException | RuntimeException ex) {
+            JOptionPane.showMessageDialog(dialogParent,
+                "Failed to import rules: " + ex.getMessage(),
+                "Import Error", JOptionPane.ERROR_MESSAGE);
         }
     }
 
@@ -304,15 +320,21 @@ public class RuleManagerPanel extends JPanel {
         JFileChooser fc = new JFileChooser();
         fc.setDialogTitle("Export Custom Rules (JSON)");
         fc.setSelectedFile(new java.io.File("blackmarker_rules.json"));
-        if (fc.showSaveDialog(this) == JFileChooser.APPROVE_OPTION) {
+        if (fc.showSaveDialog(dialogParent) == JFileChooser.APPROVE_OPTION) {
+            if (fc.getSelectedFile().exists() && JOptionPane.showConfirmDialog(dialogParent,
+                    fc.getSelectedFile().getName() + " already exists. Overwrite it?",
+                    "Confirm overwrite", JOptionPane.YES_NO_OPTION,
+                    JOptionPane.WARNING_MESSAGE) != JOptionPane.YES_OPTION) {
+                return;
+            }
             try {
                 String json = engine.serializeCustomRules();
                 java.nio.file.Files.write(fc.getSelectedFile().toPath(),
                     json.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-                JOptionPane.showMessageDialog(this, "Rules exported successfully.",
+                JOptionPane.showMessageDialog(dialogParent, "Rules exported successfully.",
                     "Export", JOptionPane.INFORMATION_MESSAGE);
             } catch (Exception ex) {
-                JOptionPane.showMessageDialog(this,
+                JOptionPane.showMessageDialog(dialogParent,
                     "Failed to export rules: " + ex.getMessage(),
                     "Export Error", JOptionPane.ERROR_MESSAGE);
             }
@@ -391,8 +413,20 @@ public class RuleManagerPanel extends JPanel {
         gbc.gridx = 1; gbc.weightx = 1;
         panel.add(descField, gbc);
 
-        // Test area
+        // Capture group / edge preservation (kept when editing built-in rules)
         gbc.gridx = 0; gbc.gridy = 6; gbc.weightx = 0;
+        panel.add(new JLabel("Mask group #:"), gbc);
+        JPanel groupPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
+        JSpinner groupSpinner = new JSpinner(new SpinnerNumberModel(0, 0, 20, 1));
+        groupSpinner.setToolTipText("0 = mask the whole match; N = mask only capture group N");
+        groupPanel.add(groupSpinner);
+        JCheckBox preserveBox = new JCheckBox("Keep first/last characters visible");
+        groupPanel.add(preserveBox);
+        gbc.gridx = 1; gbc.weightx = 1;
+        panel.add(groupPanel, gbc);
+
+        // Test area
+        gbc.gridx = 0; gbc.gridy = 7; gbc.weightx = 0;
         panel.add(new JLabel("Test Input:"), gbc);
         JTextArea testInput = new JTextArea(3, 40);
         testInput.setFont(new Font("Monospaced", Font.PLAIN, 12));
@@ -401,7 +435,7 @@ public class RuleManagerPanel extends JPanel {
 
         JButton testBtn = new JButton("Test Regex");
         JLabel testResult = new JLabel(" ");
-        gbc.gridx = 0; gbc.gridy = 7;
+        gbc.gridx = 0; gbc.gridy = 8;
         panel.add(testBtn, gbc);
         gbc.gridx = 1;
         panel.add(testResult, gbc);
@@ -434,19 +468,21 @@ public class RuleManagerPanel extends JPanel {
             regexField.setText(existingRule.getRegex());
             maskField.setText(String.valueOf(existingRule.getMaskChar()));
             descField.setText(existingRule.getDescription());
+            groupSpinner.setValue(existingRule.getCaptureGroupToMask());
+            preserveBox.setSelected(existingRule.isPreserveEdges());
         } else {
             maskField.setText("\u2588");
             categoryBox.setSelectedItem(RuleCategory.CUSTOM);
         }
 
-        int result = JOptionPane.showConfirmDialog(this, panel, title,
+        int result = JOptionPane.showConfirmDialog(dialogParent, panel, title,
             JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
 
         if (result == JOptionPane.OK_OPTION) {
             String name = nameField.getText().trim();
             String regex = regexField.getText().trim();
             if (name.isEmpty() || regex.isEmpty()) {
-                JOptionPane.showMessageDialog(this, "Name and regex pattern are required.",
+                JOptionPane.showMessageDialog(dialogParent, "Name and regex pattern are required.",
                     "Validation Error", JOptionPane.ERROR_MESSAGE);
                 return null;
             }
@@ -455,7 +491,7 @@ public class RuleManagerPanel extends JPanel {
             try {
                 Pattern.compile(regex, Pattern.CASE_INSENSITIVE);
             } catch (PatternSyntaxException e) {
-                JOptionPane.showMessageDialog(this, "Invalid regex: " + e.getDescription(),
+                JOptionPane.showMessageDialog(dialogParent, "Invalid regex: " + e.getDescription(),
                     "Validation Error", JOptionPane.ERROR_MESSAGE);
                 return null;
             }
@@ -463,9 +499,13 @@ public class RuleManagerPanel extends JPanel {
             char maskChar = maskField.getText().isEmpty() ? '\u2588' : maskField.getText().charAt(0);
             RuleCategory category = (RuleCategory) categoryBox.getSelectedItem();
 
+            // Editing keeps the rule's identity: built-in stays built-in (its edits are persisted
+            // as overrides), and capture-group / edge settings are not silently dropped
             return new MaskingRule(name, regex, category, maskChar,
-                existingRule != null ? existingRule.isEnabled() : true,
-                false, descField.getText().trim());
+                existingRule == null || existingRule.isEnabled(),
+                existingRule != null && existingRule.isBuiltIn(),
+                descField.getText().trim(),
+                (Integer) groupSpinner.getValue(), preserveBox.isSelected());
         }
 
         return null;

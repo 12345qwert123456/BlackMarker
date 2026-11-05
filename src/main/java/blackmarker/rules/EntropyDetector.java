@@ -5,6 +5,7 @@ import blackmarker.model.RuleCategory;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.regex.Pattern;
 
 /**
  * Detects high-entropy strings that may be secrets, tokens, or keys.
@@ -12,15 +13,26 @@ import java.util.List;
  */
 public class EntropyDetector {
 
-    private boolean enabled = true;
-    private double entropyThreshold = 4.5;
-    private int minLength = 20;
-    private int maxLength = 500;
+    private volatile boolean enabled = true;
+    private volatile double entropyThreshold = 4.5;
+    private volatile int minLength = 20;
+    private volatile int maxLength = 500;
 
     // Character classes for entropy analysis
     // Note: '=' excluded so that name=value is split into two tokens
     // ':' excluded so that Header:value is split into two tokens
     private static final String TOKEN_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_+/.;";
+
+    private static final boolean[] IS_TOKEN_CHAR = new boolean[128];
+    static {
+        for (int i = 0; i < TOKEN_CHARS.length(); i++) {
+            IS_TOKEN_CHAR[TOKEN_CHARS.charAt(i)] = true;
+        }
+    }
+
+    private static final double LN2 = Math.log(2);
+    private static final Pattern LOWER_ONLY = Pattern.compile("[a-z]+");
+    private static final Pattern UPPER_ONLY = Pattern.compile("[A-Z]+");
 
     /**
      * Detect high-entropy strings in the given text.
@@ -30,6 +42,10 @@ public class EntropyDetector {
         if (!enabled || text == null || text.isEmpty()) {
             return matches;
         }
+
+        final int min = minLength;
+        final int max = maxLength;
+        final double threshold = entropyThreshold;
 
         // Scan for contiguous token-like strings
         int i = 0;
@@ -47,18 +63,18 @@ public class EntropyDetector {
             }
 
             int length = i - start;
-            if (length >= minLength && length <= maxLength) {
+            if (length >= min && length <= max) {
                 String token = text.substring(start, i);
 
                 // Skip if it looks like a common word, URL path, or known non-secret
                 if (!looksLikeNoise(token)) {
                     double entropy = calculateShannonEntropy(token);
-                    if (entropy >= entropyThreshold) {
+                    if (entropy >= threshold) {
                         matches.add(new MaskMatch(
                             start, i,
                             RuleCategory.CRYPTO,
                             "High Entropy String (H=" + String.format("%.2f", entropy) + ")",
-                            '\u2588'
+                            '█'
                         ));
                     }
                 }
@@ -76,7 +92,8 @@ public class EntropyDetector {
         if (text == null || text.isEmpty()) return 0.0;
 
         int[] freq = new int[256];
-        for (char c : text.toCharArray()) {
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
             if (c < 256) freq[c]++;
         }
 
@@ -85,25 +102,25 @@ public class EntropyDetector {
         for (int f : freq) {
             if (f > 0) {
                 double p = f / len;
-                entropy -= p * (Math.log(p) / Math.log(2));
+                entropy -= p * (Math.log(p) / LN2);
             }
         }
         return entropy;
     }
 
-    private boolean isTokenChar(char c) {
-        return TOKEN_CHARS.indexOf(c) >= 0;
+    private static boolean isTokenChar(char c) {
+        return c < 128 && IS_TOKEN_CHAR[c];
     }
 
     /**
      * Filter out likely non-secrets: common words, repeated patterns, etc.
      */
-    private boolean looksLikeNoise(String token) {
+    private static boolean looksLikeNoise(String token) {
         // Skip if it's all the same character
         if (token.chars().distinct().count() <= 3) return true;
 
         // Skip if it looks like a version string or common path component
-        if (token.matches("^[a-z]+$") || token.matches("^[A-Z]+$")) return true;
+        if (LOWER_ONLY.matcher(token).matches() || UPPER_ONLY.matcher(token).matches()) return true;
 
         // Skip if mostly dots (like a domain name)
         long dotCount = token.chars().filter(c -> c == '.').count();

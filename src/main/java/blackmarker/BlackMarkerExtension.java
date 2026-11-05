@@ -2,13 +2,21 @@ package blackmarker;
 
 import blackmarker.engine.MaskingEngine;
 import blackmarker.export.SessionExporter;
-import blackmarker.model.PluginSettings;
+import blackmarker.persistence.StateStore;
+import blackmarker.rules.SessionValueTracker;
 import blackmarker.ui.*;
 
 import burp.api.montoya.BurpExtension;
 import burp.api.montoya.MontoyaApi;
+import burp.api.montoya.core.ByteArray;
+import burp.api.montoya.core.ToolType;
 import burp.api.montoya.http.handler.*;
-import burp.api.montoya.persistence.PersistedObject;
+import burp.api.montoya.http.message.HttpHeader;
+
+import java.util.EnumSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Set;
 
 /**
  * BlackMarker — Burp Suite extension for visual masking of sensitive data.
@@ -23,7 +31,7 @@ import burp.api.montoya.persistence.PersistedObject;
  * - Auto-learning of session values (cookies, tokens)
  * - Color-coded masking by data type (PII=blue, Auth=red, Infra=orange, etc.)
  * - Context menu "Copy Masked" for clipboard operations
- * - Export masked sessions to HTML/Text
+ * - Export masked sessions to HTML/Text (runs in the background)
  * - Custom rule editor with live regex testing
  * - Rule categories: PII, Auth, Infrastructure, Crypto, Session, Custom
  *
@@ -33,31 +41,35 @@ import burp.api.montoya.persistence.PersistedObject;
  * - BlackMarkerTab: main configuration/management tab
  * - ContextMenuProvider: right-click copy masked content
  * - SessionExporter: export proxy history with masking applied
- *
- * @version 1.0.0
+ * - StateStore: persistence of rules and settings
  */
 public class BlackMarkerExtension implements BurpExtension {
 
-    private static final String EXTENSION_NAME = "BlackMarker";
-    private static final String PERSIST_KEY_CUSTOM_RULES = "blackmarker.custom_rules";
-    private static final String PERSIST_KEY_BUILTIN_STATE = "blackmarker.builtin_state";
-    private static final String PERSIST_KEY_SETTINGS = "blackmarker.settings";
-    private static final String PERSIST_KEY_PLUGIN_SETTINGS = "blackmarker.plugin_settings";
+    /** Tools whose traffic feeds auto-learn. Scanner/Sequencer/etc. are high volume and skipped. */
+    private static final Set<ToolType> LEARN_TOOLS =
+        EnumSet.of(ToolType.PROXY, ToolType.REPEATER, ToolType.INTRUDER, ToolType.EXTENSIONS);
+
+    /** Bodies larger than this are not inspected for tokens (headers still are). */
+    private static final int MAX_LEARN_BODY_BYTES = 64 * 1024;
 
     private MontoyaApi api;
     private MaskingEngine engine;
     private SessionExporter exporter;
+    private StateStore stateStore;
 
     @Override
     public void initialize(MontoyaApi api) {
         this.api = api;
-        api.extension().setName(EXTENSION_NAME);
+        api.extension().setName(Version.EXTENSION_NAME);
 
         // Initialize masking engine
         engine = new MaskingEngine();
+        engine.setErrorSink(msg -> api.logging().logToError("[BlackMarker] " + msg));
 
-        // Load persisted settings
-        loadPersistedState();
+        // Load persisted state, then keep it saved in the background
+        stateStore = new StateStore(api, engine);
+        stateStore.load();
+        stateStore.startAutosave();
 
         // Initialize exporter
         exporter = new SessionExporter(api, engine);
@@ -78,19 +90,19 @@ public class BlackMarkerExtension implements BurpExtension {
         );
 
         // Register main BlackMarker configuration tab
-        BlackMarkerTab mainTab = new BlackMarkerTab(engine);
+        BlackMarkerTab mainTab = new BlackMarkerTab(api, engine);
         mainTab.setExporter(exporter);
-        api.userInterface().registerSuiteTab(EXTENSION_NAME, mainTab);
+        api.userInterface().registerSuiteTab(Version.SHORT_NAME, mainTab);
 
         // Register HTTP handler for auto-learning session values
         api.http().registerHttpHandler(new AutoLearnHttpHandler());
 
-        // Register unload handler to persist state
+        // Register unload handler: stop background work and persist state
         api.extension().registerUnloadingHandler(this::onUnload);
 
         // Log startup
         api.logging().logToOutput("========================================");
-        api.logging().logToOutput("  BlackMarker v1.0.0 loaded successfully");
+        api.logging().logToOutput("  " + Version.EXTENSION_NAME + " v" + Version.get() + " loaded");
         api.logging().logToOutput("  Rules: " + engine.getRules().size() + " loaded");
         api.logging().logToOutput("  Entropy detection: " +
             (engine.getEntropyDetector().isEnabled() ? "ON" : "OFF"));
@@ -102,18 +114,22 @@ public class BlackMarkerExtension implements BurpExtension {
     /**
      * HTTP Handler that feeds traffic to the session value tracker
      * for automatic learning of session-specific tokens and cookies.
+     *
+     * It runs on Burp's traffic threads, so it exits early for tools and content it does not
+     * care about, never converts a whole message to a string, and keeps no reference to the
+     * message after returning.
      */
     private class AutoLearnHttpHandler implements HttpHandler {
 
+        private volatile boolean errorLogged;
+
         @Override
         public RequestToBeSentAction handleHttpRequestToBeSent(HttpRequestToBeSent requestToBeSent) {
-            // Learn session values from outgoing requests
-            if (engine.getSessionValueTracker().isEnabled()) {
+            if (shouldLearn(requestToBeSent.toolSource().toolType())) {
                 try {
-                    String rawRequest = requestToBeSent.toString();
-                    engine.learnFromMessage(rawRequest);
-                } catch (Exception e) {
-                    // Silently ignore errors in auto-learn
+                    learn(requestToBeSent.headers(), requestToBeSent.body());
+                } catch (RuntimeException e) {
+                    logOnce(e);
                 }
             }
             // Never modify the request
@@ -122,119 +138,57 @@ public class BlackMarkerExtension implements BurpExtension {
 
         @Override
         public ResponseReceivedAction handleHttpResponseReceived(HttpResponseReceived responseReceived) {
-            // Learn session values from incoming responses
-            if (engine.getSessionValueTracker().isEnabled()) {
+            if (shouldLearn(responseReceived.toolSource().toolType())) {
                 try {
-                    String rawResponse = responseReceived.toString();
-                    engine.learnFromMessage(rawResponse);
-                } catch (Exception e) {
-                    // Silently ignore errors in auto-learn
+                    learn(responseReceived.headers(), responseReceived.body());
+                } catch (RuntimeException e) {
+                    logOnce(e);
                 }
             }
             // Never modify the response
             return ResponseReceivedAction.continueWith(responseReceived);
         }
-    }
 
-    /**
-     * Load persisted rules and settings from Burp's persistence store.
-     */
-    private void loadPersistedState() {
-        try {
-            PersistedObject persistence = api.persistence().extensionData();
+        private boolean shouldLearn(ToolType tool) {
+            return engine.getSessionValueTracker().isEnabled() && LEARN_TOOLS.contains(tool);
+        }
 
-            // Load custom rules
-            String customRulesJson = persistence.getString(PERSIST_KEY_CUSTOM_RULES);
-            if (customRulesJson != null && !customRulesJson.isEmpty()) {
-                engine.loadCustomRules(customRulesJson);
-                api.logging().logToOutput("[BlackMarker] Loaded persisted custom rules");
+        private void learn(List<HttpHeader> headers, ByteArray body) {
+            SessionValueTracker tracker = engine.getSessionValueTracker();
+
+            String contentType = null;
+            for (HttpHeader header : headers) {
+                String name = header.name();
+                if (name.equalsIgnoreCase("Content-Type")) contentType = header.value();
+                tracker.learnFromHeader(name, header.value());
             }
 
-            // Load built-in rule states
-            String builtInStateJson = persistence.getString(PERSIST_KEY_BUILTIN_STATE);
-            if (builtInStateJson != null && !builtInStateJson.isEmpty()) {
-                engine.loadBuiltInState(builtInStateJson);
-                api.logging().logToOutput("[BlackMarker] Restored built-in rule states");
-            }
+            if (contentType == null) return;
+            int length = body.length();
+            if (length == 0 || length > MAX_LEARN_BODY_BYTES) return;
 
-            // Load settings
-            String settingsJson = persistence.getString(PERSIST_KEY_SETTINGS);
-            if (settingsJson != null && !settingsJson.isEmpty()) {
-                loadSettings(settingsJson);
+            String type = contentType.toLowerCase(Locale.ROOT);
+            if (type.contains("json")) {
+                tracker.learnFromJson(body.toString());
+            } else if (type.contains("x-www-form-urlencoded")) {
+                tracker.learnFromForm(body.toString());
             }
+        }
 
-            // Load plugin settings (monochrome, mask char, truncation, custom categories, colors)
-            String pluginSettingsJson = persistence.getString(PERSIST_KEY_PLUGIN_SETTINGS);
-            if (pluginSettingsJson != null && !pluginSettingsJson.isEmpty()) {
-                PluginSettings.getInstance().deserialize(pluginSettingsJson);
-                api.logging().logToOutput("[BlackMarker] Restored plugin settings");
+        private void logOnce(RuntimeException e) {
+            if (!errorLogged) {
+                errorLogged = true;
+                api.logging().logToError("[BlackMarker] Auto-learn error (further errors suppressed): " + e);
             }
-        } catch (Exception e) {
-            api.logging().logToError("[BlackMarker] Failed to load persisted state: " + e.getMessage());
         }
     }
 
     /**
-     * Persist current state before extension unload.
+     * Stop background work and persist state when the extension is unloaded.
      */
     private void onUnload() {
-        try {
-            PersistedObject persistence = api.persistence().extensionData();
-
-            // Save custom rules
-            persistence.setString(PERSIST_KEY_CUSTOM_RULES, engine.serializeCustomRules());
-
-            // Save built-in rule states
-            persistence.setString(PERSIST_KEY_BUILTIN_STATE, engine.serializeBuiltInState());
-
-            // Save settings
-            persistence.setString(PERSIST_KEY_SETTINGS, serializeSettings());
-
-            // Save plugin settings
-            persistence.setString(PERSIST_KEY_PLUGIN_SETTINGS, PluginSettings.getInstance().serialize());
-
-            api.logging().logToOutput("[BlackMarker] State persisted successfully");
-        } catch (Exception e) {
-            api.logging().logToError("[BlackMarker] Failed to persist state: " + e.getMessage());
-        }
-
+        if (exporter != null) exporter.shutdown();
+        if (stateStore != null) stateStore.shutdown();
         api.logging().logToOutput("[BlackMarker] Extension unloaded");
-    }
-
-    /**
-     * Serialize current settings to JSON.
-     */
-    private String serializeSettings() {
-        StringBuilder sb = new StringBuilder("{");
-        sb.append("\"enabled\":").append(engine.isEnabled()).append(",");
-        sb.append("\"entropyEnabled\":").append(engine.getEntropyDetector().isEnabled()).append(",");
-        sb.append("\"entropyThreshold\":").append(engine.getEntropyDetector().getEntropyThreshold()).append(",");
-        sb.append("\"entropyMinLength\":").append(engine.getEntropyDetector().getMinLength()).append(",");
-        sb.append("\"sessionAutoLearn\":").append(engine.getSessionValueTracker().isEnabled());
-        sb.append("}");
-        return sb.toString();
-    }
-
-    /**
-     * Load settings from JSON.
-     */
-    private void loadSettings(String json) {
-        try {
-            // Simple parsing for our known format
-            if (json.contains("\"enabled\":false")) engine.setEnabled(false);
-            if (json.contains("\"entropyEnabled\":false")) engine.getEntropyDetector().setEnabled(false);
-            if (json.contains("\"sessionAutoLearn\":false")) engine.getSessionValueTracker().setEnabled(false);
-
-            // Extract numeric values
-            java.util.regex.Matcher m;
-
-            m = java.util.regex.Pattern.compile("\"entropyThreshold\":(\\d+\\.?\\d*)").matcher(json);
-            if (m.find()) engine.getEntropyDetector().setEntropyThreshold(Double.parseDouble(m.group(1)));
-
-            m = java.util.regex.Pattern.compile("\"entropyMinLength\":(\\d+)").matcher(json);
-            if (m.find()) engine.getEntropyDetector().setMinLength(Integer.parseInt(m.group(1)));
-        } catch (Exception e) {
-            // Use defaults on parse error
-        }
     }
 }

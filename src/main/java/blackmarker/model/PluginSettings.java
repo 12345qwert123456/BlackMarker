@@ -1,7 +1,13 @@
 package blackmarker.model;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+
 import java.awt.Color;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
@@ -33,8 +39,8 @@ public final class PluginSettings {
     private final CopyOnWriteArrayList<CustomCategory> customCategories = new CopyOnWriteArrayList<>();
 
     // --- Category color overrides for built-in categories ---
-    private final Map<RuleCategory, Color> categoryFgOverrides = new LinkedHashMap<>();
-    private final Map<RuleCategory, Color> categoryBgOverrides = new LinkedHashMap<>();
+    private final Map<RuleCategory, Color> categoryFgOverrides = new ConcurrentHashMap<>();
+    private final Map<RuleCategory, Color> categoryBgOverrides = new ConcurrentHashMap<>();
 
     private final List<Runnable> changeListeners = new CopyOnWriteArrayList<>();
 
@@ -158,109 +164,90 @@ public final class PluginSettings {
     // ============================ Serialization ============================
 
     public String serialize() {
-        StringBuilder sb = new StringBuilder("{");
-        sb.append("\"monochrome\":").append(monochrome).append(",");
-        sb.append("\"globalMaskChar\":\"").append(escapeChar(globalMaskChar)).append("\",");
-        sb.append("\"truncationEnabled\":").append(truncationEnabled).append(",");
-        sb.append("\"maxMaskedLength\":").append(maxMaskedLength).append(",");
+        JsonObject o = new JsonObject();
+        o.addProperty("monochrome", monochrome);
+        o.addProperty("globalMaskChar", String.valueOf(globalMaskChar));
+        o.addProperty("truncationEnabled", truncationEnabled);
+        o.addProperty("maxMaskedLength", maxMaskedLength);
 
-        // Custom categories
-        sb.append("\"customCategories\":[");
-        boolean first = true;
+        JsonArray cats = new JsonArray();
         for (CustomCategory c : customCategories) {
-            if (!first) sb.append(",");
-            first = false;
-            sb.append("{\"id\":\"").append(esc(c.getId()))
-              .append("\",\"name\":\"").append(esc(c.getName()))
-              .append("\",\"fg\":\"").append(colorToHex(c.getForeground()))
-              .append("\",\"bg\":\"").append(colorToHex(c.getBackground()))
-              .append("\"}");
+            JsonObject co = new JsonObject();
+            co.addProperty("id", c.getId());
+            co.addProperty("name", c.getName());
+            co.addProperty("fg", colorToHex(c.getForeground()));
+            co.addProperty("bg", colorToHex(c.getBackground()));
+            cats.add(co);
         }
-        sb.append("],");
-
-        // Category color overrides
-        sb.append("\"fgOverrides\":{");
-        first = true;
-        for (var e : categoryFgOverrides.entrySet()) {
-            if (!first) sb.append(",");
-            first = false;
-            sb.append("\"").append(e.getKey().name()).append("\":\"").append(colorToHex(e.getValue())).append("\"");
-        }
-        sb.append("},");
-        sb.append("\"bgOverrides\":{");
-        first = true;
-        for (var e : categoryBgOverrides.entrySet()) {
-            if (!first) sb.append(",");
-            first = false;
-            sb.append("\"").append(e.getKey().name()).append("\":\"").append(colorToHex(e.getValue())).append("\"");
-        }
-        sb.append("}}");
-        return sb.toString();
+        o.add("customCategories", cats);
+        o.add("fgOverrides", overridesToJson(categoryFgOverrides));
+        o.add("bgOverrides", overridesToJson(categoryBgOverrides));
+        return o.toString();
     }
 
+    /**
+     * Restore settings from {@link #serialize()} output (also reads files written by 1.0.0,
+     * which used the same JSON shape). Missing or malformed fields keep their current values.
+     */
     public void deserialize(String json) {
-        if (json == null || json.isEmpty()) return;
+        if (json == null || json.isBlank()) return;
+        JsonObject o;
         try {
-            monochrome = json.contains("\"monochrome\":true");
+            o = JsonParser.parseString(json).getAsJsonObject();
+        } catch (RuntimeException e) {
+            return;
+        }
 
-            java.util.regex.Matcher m;
+        monochrome = bool(o, "monochrome", monochrome);
+        truncationEnabled = bool(o, "truncationEnabled", truncationEnabled);
 
-            m = java.util.regex.Pattern.compile("\"globalMaskChar\":\"((?:[^\"\\\\]|\\\\.)*)\"").matcher(json);
-            if (m.find()) {
-                String val = m.group(1);
-                if (val.startsWith("\\u")) {
-                    globalMaskChar = (char) Integer.parseInt(val.substring(2), 16);
-                } else if (!val.isEmpty()) {
-                    globalMaskChar = val.charAt(0);
-                }
-            }
+        JsonElement mc = o.get("globalMaskChar");
+        if (mc != null && mc.isJsonPrimitive() && !mc.getAsString().isEmpty()) {
+            globalMaskChar = mc.getAsString().charAt(0);
+        }
+        JsonElement ml = o.get("maxMaskedLength");
+        if (ml != null && ml.isJsonPrimitive()) {
+            try { maxMaskedLength = Math.max(4, ml.getAsInt()); } catch (RuntimeException ignored) {}
+        }
 
-            truncationEnabled = json.contains("\"truncationEnabled\":true");
-
-            m = java.util.regex.Pattern.compile("\"maxMaskedLength\":(\\d+)").matcher(json);
-            if (m.find()) maxMaskedLength = Math.max(4, Integer.parseInt(m.group(1)));
-
-            // Custom categories
+        if (o.has("customCategories") && o.get("customCategories").isJsonArray()) {
             customCategories.clear();
-            m = java.util.regex.Pattern.compile(
-                "\\{\"id\":\"([^\"]*)\",\"name\":\"([^\"]*)\",\"fg\":\"([^\"]*)\",\"bg\":\"([^\"]*)\"\\}"
-            ).matcher(json);
-            while (m.find()) {
-                customCategories.add(new CustomCategory(
-                    m.group(1), m.group(2),
-                    hexToColor(m.group(3)), hexToColor(m.group(4))
-                ));
+            for (JsonElement e : o.getAsJsonArray("customCategories")) {
+                try {
+                    JsonObject c = e.getAsJsonObject();
+                    customCategories.add(new CustomCategory(
+                        c.get("id").getAsString(), c.get("name").getAsString(),
+                        hexToColor(c.get("fg").getAsString()), hexToColor(c.get("bg").getAsString())));
+                } catch (RuntimeException ignored) {}
             }
+        }
 
-            // Category FG overrides
-            categoryFgOverrides.clear();
-            java.util.regex.Matcher fgBlock = java.util.regex.Pattern.compile(
-                "\"fgOverrides\":\\{([^}]*)\\}"
-            ).matcher(json);
-            if (fgBlock.find()) {
-                parseColorOverrides(fgBlock.group(1), categoryFgOverrides);
-            }
-
-            // Category BG overrides
-            categoryBgOverrides.clear();
-            java.util.regex.Matcher bgBlock = java.util.regex.Pattern.compile(
-                "\"bgOverrides\":\\{([^}]*)\\}"
-            ).matcher(json);
-            if (bgBlock.find()) {
-                parseColorOverrides(bgBlock.group(1), categoryBgOverrides);
-            }
-        } catch (Exception ignored) {}
+        categoryFgOverrides.clear();
+        overridesFromJson(o.get("fgOverrides"), categoryFgOverrides);
+        categoryBgOverrides.clear();
+        overridesFromJson(o.get("bgOverrides"), categoryBgOverrides);
     }
 
-    private void parseColorOverrides(String block, Map<RuleCategory, Color> map) {
-        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
-            "\"(\\w+)\":\"(#[0-9a-fA-F]{6})\""
-        ).matcher(block);
-        while (m.find()) {
+    private static boolean bool(JsonObject o, String key, boolean fallback) {
+        JsonElement e = o.get(key);
+        return e != null && e.isJsonPrimitive() && e.getAsJsonPrimitive().isBoolean()
+            ? e.getAsBoolean() : fallback;
+    }
+
+    private static JsonObject overridesToJson(Map<RuleCategory, Color> map) {
+        JsonObject o = new JsonObject();
+        for (var e : map.entrySet()) {
+            o.addProperty(e.getKey().name(), colorToHex(e.getValue()));
+        }
+        return o;
+    }
+
+    private static void overridesFromJson(JsonElement el, Map<RuleCategory, Color> map) {
+        if (el == null || !el.isJsonObject()) return;
+        for (var e : el.getAsJsonObject().entrySet()) {
             try {
-                RuleCategory cat = RuleCategory.valueOf(m.group(1));
-                map.put(cat, hexToColor(m.group(2)));
-            } catch (Exception ignored) {}
+                map.put(RuleCategory.valueOf(e.getKey()), hexToColor(e.getValue().getAsString()));
+            } catch (RuntimeException ignored) {}
         }
     }
 
@@ -275,14 +262,5 @@ public final class PluginSettings {
             Integer.parseInt(hex.substring(3, 5), 16),
             Integer.parseInt(hex.substring(5, 7), 16)
         );
-    }
-
-    private static String esc(String s) {
-        return s == null ? "" : s.replace("\\", "\\\\").replace("\"", "\\\"");
-    }
-
-    private static String escapeChar(char c) {
-        if (c > 127) return "\\u" + String.format("%04x", (int) c);
-        return String.valueOf(c);
     }
 }

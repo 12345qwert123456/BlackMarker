@@ -1,8 +1,8 @@
-# BlackMarker — Burp Suite Sensitive Data Masking Extension
+# BlackMarker, Sensitive Data Redactor — Burp Suite Extension
 
 **Visual masking of sensitive data in Burp Suite for safe screen sharing and screenshots.**
 
-![Version](https://img.shields.io/badge/version-1.0.0-blue)
+![Version](https://img.shields.io/badge/version-1.1-blue)
 ![API](https://img.shields.io/badge/Burp_API-Montoya-green)
 ![Java](https://img.shields.io/badge/Java-17%2B-orange)
 ![License](https://img.shields.io/badge/license-MIT-brightgreen)
@@ -45,7 +45,8 @@ BlackMarker adds a **"BlackMarker"** tab to every HTTP message editor in Burp Su
 - **"BlackMarker" tab** in every HTTP message editor
 - **Context menu** — right-click → "Copy Masked Request/Response" to clipboard
 - **Main BlackMarker tab** — rules management, settings, live test, auto-learn dashboard
-- **Persistence** — all rules and settings survive Burp restarts via Persistence API
+- **Persistence** — all rules and settings (including edits to built-in rules) survive Burp restarts via Persistence API; state is autosaved in the background
+- **Session export** — export the masked proxy history to HTML or plain text; runs in the background with a progress dialog and Cancel
 
 ## Rule Categories
 
@@ -65,13 +66,13 @@ BlackMarker adds a **"BlackMarker"** tab to every HTTP message editor in Burp Su
 **Option A — Gradle (requires Java 17+ and Gradle 7+):**
 ```bash
 ./gradlew jar
-# Output: build/libs/BlackMarker-1.0.0.jar
+# Output: build/libs/BlackMarker-1.1.jar
 ```
 
 **Option B — Docker (no local Java required):**
 ```bash
 docker build --target artifact --output build/ .
-# Output: build/BlackMarker-1.0.0.jar
+# Output: build/BlackMarker-1.1.jar
 ```
 
 ### Load into Burp Suite
@@ -79,7 +80,7 @@ docker build --target artifact --output build/ .
 1. Open Burp Suite (Professional or Community)
 2. Go to **Extensions → Installed → Add**
 3. Set **Extension type: Java**
-4. Select `BlackMarker-1.0.0.jar`
+4. Select `BlackMarker-1.1.jar`
 5. Click **Next** — you should see "BlackMarker loaded" in the output
 
 ## Usage
@@ -148,17 +149,22 @@ blackmarker/
 │   ├── MaskedTextPane.java            # Custom JTextPane with colored masking
 │   ├── MaskedRequestEditorProvider.java   # Request editor tab provider
 │   ├── MaskedResponseEditorProvider.java  # Response editor tab provider
+│   ├── MaskedEditorPanel.java         # UI shared by the request/response editor tabs
 │   ├── ContextMenuProvider.java       # "Copy Masked" context menu
 │   └── ColorScheme.java              # Color scheme with overrides
+├── persistence/
+│   └── StateStore.java                # Load/autosave of rules and settings
 └── export/
-    └── SessionExporter.java           # HTML/Text export
+    └── SessionExporter.java           # HTML/Text export (background SwingWorker)
 ```
 
 ## Design Principles
 
 - **Visual only** — HTTP traffic is never modified; masking is purely for display
 - **Same-length replacement** — masked text has the same length as original (positions preserved for click-to-reveal)
-- **Thread-safe** — ConcurrentHashMap for session tracking, CopyOnWriteArrayList for rules
+- **Thread-safe** — CopyOnWriteArrayList for rules, bounded synchronized store for session tracking
+- **Responsive** — the HTTP handler only inspects headers and small JSON/form bodies from Proxy/Repeater/Intruder and exits early otherwise; large messages and exports are masked off the Swing thread
+- **Untrusted input** — every regex runs under a time budget, so a pathological pattern cannot hang Burp; messages over 2 MB are truncated for display, never shown unmasked
 - **Persistence** — rules, settings, and preferences saved via Burp Persistence API
 - **Burp theme aware** — UI adapts to Burp's light/dark theme
 
@@ -181,6 +187,12 @@ blackmarker/
     "description": "Internal project identifiers"
   }
 ]
+```
+
+## Building and testing
+
+```bash
+./gradlew test jar   # unit tests + build/libs/BlackMarker-<version>.jar (Gson is bundled)
 ```
 
 ## Requirements

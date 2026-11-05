@@ -1,10 +1,13 @@
 package blackmarker.ui;
 
+import blackmarker.Version;
 import blackmarker.engine.MaskingEngine;
 import blackmarker.export.SessionExporter;
 import blackmarker.model.CustomCategory;
 import blackmarker.model.PluginSettings;
 import blackmarker.model.RuleCategory;
+
+import burp.api.montoya.MontoyaApi;
 
 import javax.swing.*;
 import javax.swing.border.TitledBorder;
@@ -22,6 +25,8 @@ import java.util.Map;
 public class BlackMarkerTab extends JPanel {
 
     private final MaskingEngine engine;
+    /** Burp's main frame; parent for dialogs. */
+    private final Frame parentFrame;
     private final RuleManagerPanel ruleManagerPanel;
     private JToggleButton masterToggle;
     private final Map<RuleCategory, JCheckBox> categoryCheckboxes;
@@ -29,8 +34,9 @@ public class BlackMarkerTab extends JPanel {
     private MaskedTextPane testOutputPane;
     private SessionExporter exporter;
 
-    public BlackMarkerTab(MaskingEngine engine) {
+    public BlackMarkerTab(MontoyaApi api, MaskingEngine engine) {
         this.engine = engine;
+        this.parentFrame = api.userInterface().swingUtils().suiteFrame();
         this.categoryCheckboxes = new EnumMap<>(RuleCategory.class);
 
         setLayout(new BorderLayout(5, 5));
@@ -44,7 +50,7 @@ public class BlackMarkerTab extends JPanel {
         JTabbedPane tabbedPane = new JTabbedPane();
 
         // Tab 1: Rule Manager
-        ruleManagerPanel = new RuleManagerPanel(engine);
+        ruleManagerPanel = new RuleManagerPanel(engine, parentFrame);
         tabbedPane.addTab("Rules", ruleManagerPanel);
 
         // Tab 2: Settings
@@ -78,9 +84,10 @@ public class BlackMarkerTab extends JPanel {
         leftPanel.add(titleLabel);
 
         // Master toggle
-        masterToggle = new JToggleButton("MASKING ON", true);
+        boolean maskingOn = engine.isEnabled();
+        masterToggle = new JToggleButton(maskingOn ? "MASKING ON" : "MASKING OFF", maskingOn);
         masterToggle.setFont(new Font("SansSerif", Font.BOLD, 13));
-        masterToggle.setForeground(ColorScheme.STATUS_ENABLED);
+        masterToggle.setForeground(maskingOn ? ColorScheme.STATUS_ENABLED : ColorScheme.STATUS_DISABLED);
         masterToggle.setPreferredSize(new Dimension(150, 32));
         masterToggle.addActionListener(e -> {
             boolean on = masterToggle.isSelected();
@@ -94,7 +101,7 @@ public class BlackMarkerTab extends JPanel {
         JButton exportBtn = new JButton("Export Session...");
         exportBtn.addActionListener(e -> {
             if (exporter != null) {
-                exporter.showExportDialog(this);
+                exporter.showExportDialog(exportBtn);
             }
         });
         leftPanel.add(exportBtn);
@@ -105,7 +112,7 @@ public class BlackMarkerTab extends JPanel {
         JPanel catPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 5, 5));
         catPanel.add(new JLabel("Categories: "));
         for (RuleCategory cat : RuleCategory.values()) {
-            JCheckBox cb = new JCheckBox(cat.getDisplayName(), true);
+            JCheckBox cb = new JCheckBox(cat.getDisplayName(), engine.isCategoryEnabled(cat));
             cb.setForeground(cat.getColor());
             cb.setFont(new Font("SansSerif", Font.BOLD, 11));
             cb.addActionListener(e -> engine.setCategoryEnabled(cat, cb.isSelected()));
@@ -244,14 +251,14 @@ public class BlackMarkerTab extends JPanel {
                 RuleCategory cat = RuleCategory.values()[row];
 
                 if (col == 1) {
-                    Color chosen = JColorChooser.showDialog(panel, "Choose Text Color for " + cat.getDisplayName(),
+                    Color chosen = JColorChooser.showDialog(parentFrame, "Choose Text Color for " + cat.getDisplayName(),
                         (Color) catTable.getValueAt(row, 1));
                     if (chosen != null) {
                         settings.setCategoryFgOverride(cat, chosen);
                         catTable.setValueAt(chosen, row, 1);
                     }
                 } else if (col == 2) {
-                    Color chosen = JColorChooser.showDialog(panel, "Choose Background for " + cat.getDisplayName(),
+                    Color chosen = JColorChooser.showDialog(parentFrame, "Choose Background for " + cat.getDisplayName(),
                         (Color) catTable.getValueAt(row, 2));
                     if (chosen != null) {
                         settings.setCategoryBgOverride(cat, chosen);
@@ -299,10 +306,10 @@ public class BlackMarkerTab extends JPanel {
                 CustomCategory cc = settings.getCustomCategories().get(row);
 
                 if (col == 1) {
-                    Color chosen = JColorChooser.showDialog(panel, "Text Color for " + cc.getName(), cc.getForeground());
+                    Color chosen = JColorChooser.showDialog(parentFrame, "Text Color for " + cc.getName(), cc.getForeground());
                     if (chosen != null) { cc.setForeground(chosen); ccModel.fireTableRowsUpdated(row, row); }
                 } else if (col == 2) {
-                    Color chosen = JColorChooser.showDialog(panel, "Background for " + cc.getName(), cc.getBackground());
+                    Color chosen = JColorChooser.showDialog(parentFrame, "Background for " + cc.getName(), cc.getBackground());
                     if (chosen != null) { cc.setBackground(chosen); ccModel.fireTableRowsUpdated(row, row); }
                 }
             }
@@ -315,12 +322,12 @@ public class BlackMarkerTab extends JPanel {
         JPanel ccButtons = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 2));
         JButton addCcBtn = new JButton("+ Add Category");
         addCcBtn.addActionListener(e -> {
-            String name = JOptionPane.showInputDialog(panel, "Category name:", "New Custom Category",
+            String name = JOptionPane.showInputDialog(parentFrame, "Category name:", "New Custom Category",
                 JOptionPane.PLAIN_MESSAGE);
             if (name != null && !name.trim().isEmpty()) {
-                Color fg = JColorChooser.showDialog(panel, "Choose text color", new Color(80, 80, 80));
+                Color fg = JColorChooser.showDialog(parentFrame, "Choose text color", new Color(80, 80, 80));
                 if (fg == null) fg = new Color(80, 80, 80);
-                Color bg = JColorChooser.showDialog(panel, "Choose background color", new Color(230, 230, 230));
+                Color bg = JColorChooser.showDialog(parentFrame, "Choose background color", new Color(230, 230, 230));
                 if (bg == null) bg = new Color(230, 230, 230);
                 settings.addCustomCategory(new CustomCategory(name.trim(), fg, bg));
                 ccModel.fireTableDataChanged();
@@ -333,7 +340,7 @@ public class BlackMarkerTab extends JPanel {
             int row = ccTable.getSelectedRow();
             if (row >= 0 && row < settings.getCustomCategories().size()) {
                 CustomCategory cc = settings.getCustomCategories().get(row);
-                String newName = JOptionPane.showInputDialog(panel, "New name:", cc.getName());
+                String newName = JOptionPane.showInputDialog(parentFrame, "New name:", cc.getName());
                 if (newName != null && !newName.trim().isEmpty()) {
                     cc.setName(newName.trim());
                     ccModel.fireTableRowsUpdated(row, row);
@@ -423,6 +430,15 @@ public class BlackMarkerTab extends JPanel {
         return wrapper;
     }
 
+    /**
+     * Tracked values are secrets and this tab may be on screen during a demo, so show only
+     * the first characters and the length.
+     */
+    private static String redact(String value) {
+        int shown = Math.min(3, value.length() / 4);
+        return value.substring(0, shown) + "\u2588".repeat(8) + " (" + value.length() + " chars)";
+    }
+
     private static int brightness(Color c) {
         return (int) (0.299 * c.getRed() + 0.587 * c.getGreen() + 0.114 * c.getBlue());
     }
@@ -502,7 +518,7 @@ public class BlackMarkerTab extends JPanel {
         // Test button action
         testBtn.addActionListener(e -> {
             String input = testInput.getText();
-            var result = engine.mask(input);
+            var result = engine.mask(MaskingEngine.clip(input));
             testOutputPane.displayMaskedResult(result);
             outputStatus.setText(result.getSummary());
             outputStatus.setForeground(result.hasMatches() ?
@@ -556,13 +572,8 @@ public class BlackMarkerTab extends JPanel {
                 sb.append("No values tracked yet. Browse websites through Burp to start auto-learning.\n");
             } else {
                 for (var entry : tracked.entrySet()) {
-                    String value = entry.getKey();
                     String source = entry.getValue();
-                    // Truncate long values for display
-                    String displayValue = value.length() > 60
-                        ? value.substring(0, 60) + "..."
-                        : value;
-                    sb.append(String.format("%-20s  %s\n", source, displayValue));
+                    sb.append(String.format("%-28s  %s\n", source, redact(entry.getKey())));
                 }
             }
             trackedDisplay.setText(sb.toString());
@@ -586,7 +597,7 @@ public class BlackMarkerTab extends JPanel {
         JPanel panel = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 2));
         panel.setBorder(BorderFactory.createMatteBorder(1, 0, 0, 0, Color.GRAY));
 
-        JLabel versionLabel = new JLabel("BlackMarker v1.0.0");
+        JLabel versionLabel = new JLabel("BlackMarker v" + Version.get());
         versionLabel.setFont(new Font("SansSerif", Font.PLAIN, 11));
         versionLabel.setForeground(Color.GRAY);
         panel.add(versionLabel);

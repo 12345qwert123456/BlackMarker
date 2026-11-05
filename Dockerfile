@@ -17,4 +17,4 @@ RUN gradle jar --no-daemon
 
 # ── Stage 2: Export artifact ───────────────────────────────────
 FROM scratch AS artifact
-COPY --from=build /app/build/libs/BlackMarker-1.0.0.jar /BlackMarker-1.0.0.jar
+COPY --from=build /app/build/libs/BlackMarker-*.jar /
